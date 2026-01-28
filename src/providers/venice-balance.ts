@@ -20,19 +20,40 @@ export interface VeniceBalance {
   lastChecked: number;
   /** Provider identifier (for multi-key scenarios) */
   providerId?: string;
+  /** Rate limit info (tracks API key spending cap usage) */
+  rateLimit?: {
+    /** Max requests allowed in current window */
+    limitRequests?: number;
+    /** Remaining requests in current window */
+    remainingRequests?: number;
+    /** Max tokens allowed in current window */
+    limitTokens?: number;
+    /** Remaining tokens in current window */
+    remainingTokens?: number;
+    /** Reset timestamp (unix ms) */
+    resetAt?: number;
+  };
 }
 
 export interface VeniceBalanceThresholds {
   enabled: boolean;
+  /** Warn when DIEM balance falls below this value (default: 5) */
   lowDiemThreshold: number;
+  /** Critical warning when DIEM balance falls below this value (default: 2) */
   criticalDiemThreshold: number;
+  /** Warn when remaining requests falls below this percentage of limit (default: 10%) */
+  lowRateLimitPercent: number;
+  /** Critical warning when remaining requests falls below this percentage (default: 5%) */
+  criticalRateLimitPercent: number;
   showInStatus: boolean;
 }
 
 export const DEFAULT_VENICE_BALANCE_THRESHOLDS: VeniceBalanceThresholds = {
   enabled: true,
-  lowDiemThreshold: 10,
+  lowDiemThreshold: 5,
   criticalDiemThreshold: 2,
+  lowRateLimitPercent: 10,
+  criticalRateLimitPercent: 5,
   showInStatus: true,
 };
 
@@ -63,10 +84,28 @@ export function extractVeniceBalance(headers: Headers | Record<string, string>):
   const usdRaw = get("x-venice-balance-usd");
   const vcuRaw = get("x-venice-balance-vcu");
 
+  // Extract rate limit headers (tracks API key spending cap)
+  const limitRequestsRaw = get("x-ratelimit-limit-requests");
+  const remainingRequestsRaw = get("x-ratelimit-remaining-requests");
+  const limitTokensRaw = get("x-ratelimit-limit-tokens");
+  const remainingTokensRaw = get("x-ratelimit-remaining-tokens");
+  const resetRequestsRaw = get("x-ratelimit-reset-requests");
+
+  const rateLimit = (limitRequestsRaw || remainingRequestsRaw || limitTokensRaw || remainingTokensRaw)
+    ? {
+        limitRequests: limitRequestsRaw ? parseInt(limitRequestsRaw, 10) : undefined,
+        remainingRequests: remainingRequestsRaw ? parseInt(remainingRequestsRaw, 10) : undefined,
+        limitTokens: limitTokensRaw ? parseInt(limitTokensRaw, 10) : undefined,
+        remainingTokens: remainingTokensRaw ? parseInt(remainingTokensRaw, 10) : undefined,
+        resetAt: resetRequestsRaw ? parseInt(resetRequestsRaw, 10) : undefined,
+      }
+    : undefined;
+
   return {
     diem,
     usd: usdRaw ? parseFloat(usdRaw) : undefined,
     vcu: vcuRaw ? parseFloat(vcuRaw) : undefined,
+    rateLimit,
     lastChecked: Date.now(),
   };
 }
@@ -119,15 +158,82 @@ export function onVeniceBalanceUpdate(
  */
 export type BalanceStatus = "ok" | "low" | "critical" | "depleted" | "unknown";
 
+export interface BalanceEvaluation {
+  status: BalanceStatus;
+  /** Why this status was assigned */
+  reason: "diem" | "rate_limit" | "unknown";
+  /** Human-readable details */
+  details?: string;
+}
+
 export function evaluateBalanceStatus(
   balance: VeniceBalance | null,
   thresholds: VeniceBalanceThresholds = DEFAULT_VENICE_BALANCE_THRESHOLDS,
 ): BalanceStatus {
-  if (!balance || balance.diem === undefined) return "unknown";
-  if (balance.diem <= 0) return "depleted";
-  if (balance.diem < thresholds.criticalDiemThreshold) return "critical";
-  if (balance.diem < thresholds.lowDiemThreshold) return "low";
-  return "ok";
+  return evaluateBalanceDetailed(balance, thresholds).status;
+}
+
+/**
+ * Evaluate balance with detailed reason.
+ */
+export function evaluateBalanceDetailed(
+  balance: VeniceBalance | null,
+  thresholds: VeniceBalanceThresholds = DEFAULT_VENICE_BALANCE_THRESHOLDS,
+): BalanceEvaluation {
+  if (!balance) return { status: "unknown", reason: "unknown" };
+
+  // Check DIEM balance first (most common)
+  if (balance.diem !== undefined) {
+    if (balance.diem <= 0) {
+      return { status: "depleted", reason: "diem", details: "DIEM balance is zero" };
+    }
+    if (balance.diem < thresholds.criticalDiemThreshold) {
+      return { status: "critical", reason: "diem", details: `DIEM below ${thresholds.criticalDiemThreshold}` };
+    }
+    if (balance.diem < thresholds.lowDiemThreshold) {
+      return { status: "low", reason: "diem", details: `DIEM below ${thresholds.lowDiemThreshold}` };
+    }
+  }
+
+  // Check rate limits (API key spending cap)
+  if (balance.rateLimit) {
+    const { limitRequests, remainingRequests, limitTokens, remainingTokens } = balance.rateLimit;
+
+    // Check request limit
+    if (limitRequests !== undefined && remainingRequests !== undefined && limitRequests > 0) {
+      const remainingPercent = (remainingRequests / limitRequests) * 100;
+      if (remainingRequests <= 0) {
+        return { status: "depleted", reason: "rate_limit", details: "Request limit exhausted" };
+      }
+      if (remainingPercent < thresholds.criticalRateLimitPercent) {
+        return { status: "critical", reason: "rate_limit", details: `Only ${remainingRequests}/${limitRequests} requests remaining` };
+      }
+      if (remainingPercent < thresholds.lowRateLimitPercent) {
+        return { status: "low", reason: "rate_limit", details: `${remainingRequests}/${limitRequests} requests remaining` };
+      }
+    }
+
+    // Check token limit
+    if (limitTokens !== undefined && remainingTokens !== undefined && limitTokens > 0) {
+      const remainingPercent = (remainingTokens / limitTokens) * 100;
+      if (remainingTokens <= 0) {
+        return { status: "depleted", reason: "rate_limit", details: "Token limit exhausted" };
+      }
+      if (remainingPercent < thresholds.criticalRateLimitPercent) {
+        return { status: "critical", reason: "rate_limit", details: `Only ${remainingTokens.toLocaleString()}/${limitTokens.toLocaleString()} tokens remaining` };
+      }
+      if (remainingPercent < thresholds.lowRateLimitPercent) {
+        return { status: "low", reason: "rate_limit", details: `${remainingTokens.toLocaleString()}/${limitTokens.toLocaleString()} tokens remaining` };
+      }
+    }
+  }
+
+  // If we have DIEM info, we're OK
+  if (balance.diem !== undefined) {
+    return { status: "ok", reason: "diem" };
+  }
+
+  return { status: "unknown", reason: "unknown" };
 }
 
 /**
@@ -140,7 +246,7 @@ export function formatVeniceBalanceStatus(
   if (!thresholds.showInStatus) return null;
   if (!balance) return null;
 
-  const status = evaluateBalanceStatus(balance, thresholds);
+  const evaluation = evaluateBalanceDetailed(balance, thresholds);
   const diemLabel = balance.diem !== undefined ? balance.diem.toFixed(2) : "?";
   const ageMs = Date.now() - balance.lastChecked;
   const ageLabel = formatAge(ageMs);
@@ -155,13 +261,25 @@ export function formatVeniceBalanceStatus(
 
   const parts = [
     `DIEM: ${diemLabel}`,
-    `Status: ${statusEmoji[status]} ${status.toUpperCase()}`,
-    `(${ageLabel})`,
   ];
 
   if (balance.usd !== undefined) {
-    parts.splice(1, 0, `USD: $${balance.usd.toFixed(2)}`);
+    parts.push(`USD: $${balance.usd.toFixed(2)}`);
   }
+
+  // Add rate limit info if available
+  if (balance.rateLimit?.remainingRequests !== undefined && balance.rateLimit?.limitRequests !== undefined) {
+    parts.push(`Requests: ${balance.rateLimit.remainingRequests}/${balance.rateLimit.limitRequests}`);
+  }
+
+  parts.push(`Status: ${statusEmoji[evaluation.status]} ${evaluation.status.toUpperCase()}`);
+  
+  // Add reason if not OK
+  if (evaluation.status !== "ok" && evaluation.details) {
+    parts.push(`(${evaluation.details})`);
+  }
+
+  parts.push(`(${ageLabel})`);
 
   return parts.join(" · ");
 }
@@ -175,21 +293,39 @@ export function generateBalanceWarning(
   thresholds: VeniceBalanceThresholds = DEFAULT_VENICE_BALANCE_THRESHOLDS,
 ): string | null {
   if (!thresholds.enabled) return null;
-  if (!balance || balance.diem === undefined) return null;
+  if (!balance) return null;
 
-  const status = evaluateBalanceStatus(balance, thresholds);
-  const diemLabel = balance.diem.toFixed(2);
+  const evaluation = evaluateBalanceDetailed(balance, thresholds);
+  const diemLabel = balance.diem !== undefined ? balance.diem.toFixed(2) : "?";
 
-  switch (status) {
-    case "critical":
-      return `🚨 Venice balance critical: ${diemLabel} DIEM remaining. Consider topping up at https://venice.ai/settings/billing`;
-    case "low":
-      return `⚠️ Venice balance low: ${diemLabel} DIEM remaining`;
-    case "depleted":
-      return `❌ Venice balance depleted (0.00 DIEM). Top up at https://venice.ai/settings/billing`;
-    default:
-      return null;
+  // DIEM-based warnings
+  if (evaluation.reason === "diem") {
+    switch (evaluation.status) {
+      case "critical":
+        return `🚨 Venice balance critical: ${diemLabel} DIEM remaining. Consider topping up at https://venice.ai/settings/billing`;
+      case "low":
+        return `⚠️ Venice balance low: ${diemLabel} DIEM remaining`;
+      case "depleted":
+        return `❌ Venice balance depleted (0.00 DIEM). Top up at https://venice.ai/settings/billing`;
+    }
   }
+
+  // Rate limit / spending cap warnings
+  if (evaluation.reason === "rate_limit") {
+    const rl = balance.rateLimit;
+    const resetInfo = rl?.resetAt ? ` (resets ${formatAge(rl.resetAt - Date.now()).replace(" ago", "")})` : "";
+    
+    switch (evaluation.status) {
+      case "critical":
+        return `🚨 Venice API key limit critical: ${evaluation.details}${resetInfo}. Consider increasing your spending cap.`;
+      case "low":
+        return `⚠️ Venice API key limit low: ${evaluation.details}${resetInfo}`;
+      case "depleted":
+        return `❌ Venice API key limit reached: ${evaluation.details}. Increase your spending cap at https://venice.ai/settings/api`;
+    }
+  }
+
+  return null;
 }
 
 /**
@@ -351,6 +487,8 @@ export function resolveVeniceBalanceThresholds(
     enabled: override.enabled ?? DEFAULT_VENICE_BALANCE_THRESHOLDS.enabled,
     lowDiemThreshold: override.lowDiemThreshold ?? DEFAULT_VENICE_BALANCE_THRESHOLDS.lowDiemThreshold,
     criticalDiemThreshold: override.criticalDiemThreshold ?? DEFAULT_VENICE_BALANCE_THRESHOLDS.criticalDiemThreshold,
+    lowRateLimitPercent: override.lowRateLimitPercent ?? DEFAULT_VENICE_BALANCE_THRESHOLDS.lowRateLimitPercent,
+    criticalRateLimitPercent: override.criticalRateLimitPercent ?? DEFAULT_VENICE_BALANCE_THRESHOLDS.criticalRateLimitPercent,
     showInStatus: override.showInStatus ?? DEFAULT_VENICE_BALANCE_THRESHOLDS.showInStatus,
   };
 }

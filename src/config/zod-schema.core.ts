@@ -76,10 +76,14 @@ export const VeniceBalanceWarningSchema = z
   .object({
     /** Enable balance warnings (default: true). */
     enabled: z.boolean().optional(),
-    /** Warn when DIEM balance falls below this threshold (default: 10). */
+    /** Warn when DIEM balance falls below this threshold (default: 5). */
     lowDiemThreshold: z.number().nonnegative().optional(),
     /** Critical warning when DIEM balance falls below this threshold (default: 2). */
     criticalDiemThreshold: z.number().nonnegative().optional(),
+    /** Warn when remaining requests falls below this percentage of limit (default: 10). */
+    lowRateLimitPercent: z.number().min(0).max(100).optional(),
+    /** Critical warning when remaining requests falls below this percentage (default: 5). */
+    criticalRateLimitPercent: z.number().min(0).max(100).optional(),
     /** Show balance in /status output (default: true). */
     showInStatus: z.boolean().optional(),
   })
